@@ -2154,6 +2154,7 @@ let aiServiceInfo = null;
 let aiAnalysisState = 'idle';
 let aiAnalysisDetail = '';
 let aiAnalysisBusy = false;
+let lastAiFailureReason = '';
 
 function escapeHtml(value) {
     return String(value ?? '')
@@ -2266,7 +2267,7 @@ function syncAiStatusPanelText() {
         uploading: ['connected', 'uploading'],
         extracting: ['connected', 'uploading', 'extracting'],
         requesting: ['connected', 'uploading', 'extracting', 'requesting'],
-        fallback: ['fallback'],
+        fallback: ['connected', 'uploading', 'extracting', 'requesting', 'fallback'],
         completed: ['connected', 'uploading', 'extracting', 'requesting'],
         failed: [],
         notConfigured: [],
@@ -2997,9 +2998,14 @@ function buildBehaviorEventNote(label, note = '') {
 
 function getAiApiBase() {
     if (window.PET_AI_API_BASE) return window.PET_AI_API_BASE.replace(/\/$/, '');
-    const host = window.location.hostname || '127.0.0.1';
     const protocol = window.location.protocol || 'http:';
-    return `${protocol}//${host}${window.location.port ? ':' + window.location.port : ''}`;
+    const host = window.location.hostname || '';
+    const port = window.location.port || '';
+    const isLocalHost = /^(localhost|127\.0\.0\.1)$/i.test(host);
+    if (protocol === 'file:') return 'http://127.0.0.1:8001';
+    if (port === '8001') return window.location.origin;
+    if (isLocalHost) return 'http://127.0.0.1:8001';
+    return `${protocol}//${host}${port ? ':' + port : ''}`;
 }
 
 function getAiEndpoint(path) {
@@ -3009,6 +3015,34 @@ function getAiEndpoint(path) {
 function getAiAnalysisEndpoint() {
     if (window.PET_AI_API_URL) return window.PET_AI_API_URL;
     return getAiEndpoint('analyze-pet-video');
+}
+
+function explainAiError(err) {
+    const raw = String(err?.message || err || '').trim();
+    if (!raw) return currentLang === 'zh' ? '未知错误' : 'Unknown error';
+    if (raw.includes('Failed to fetch')) {
+        return currentLang === 'zh'
+            ? '前端没有连到 AI 后端。请确认页面是从 http://127.0.0.1:8001/app.html 打开的，或者已正确配置 PET_AI_API_BASE。'
+            : 'The app could not reach the AI backend. Open the page from http://127.0.0.1:8001/app.html or configure PET_AI_API_BASE correctly.';
+    }
+    if (raw.includes('NetworkError')) {
+        return currentLang === 'zh' ? '网络请求失败，无法连接到 AI 后端。' : 'Network request failed while connecting to the AI backend.';
+    }
+    if (raw.includes('503')) {
+        return currentLang === 'zh' ? 'AI 服务暂时不可用或 API Key 未生效。' : 'The AI service is temporarily unavailable or the API key is not active.';
+    }
+    if (raw.includes('500')) {
+        if (currentLang === 'zh') return '后端分析接口返回 500：' + raw;
+        return currentLang === 'zh' ? `后端分析接口返回 500：${raw}` : `The backend analysis endpoint returned 500: ${raw}`;
+    }
+    if (raw.includes('DashScope request failed')) {
+        if (currentLang === 'zh') return '千问请求失败：' + raw;
+        return currentLang === 'zh' ? `千问请求失败：${raw}` : `Qwen request failed: ${raw}`;
+    }
+    if (raw.includes('No AI API key is configured')) {
+        return currentLang === 'zh' ? '后端没有检测到 DASHSCOPE_API_KEY / QWEN_API_KEY。' : 'The backend did not detect DASHSCOPE_API_KEY / QWEN_API_KEY.';
+    }
+    return raw;
 }
 
 function parseAiClock(value) {
@@ -3028,6 +3062,35 @@ function normalizeAiLabel(label) {
 
 async function analyzeVideoWithAi(file, video, onProgress) {
     if (!file) throw new Error('no_video_file');
+    if (onProgress) onProgress(8, currentLang === 'zh' ? '正在上传视频...' : 'Uploading video...', 'uploading');
+
+    const formData = new FormData();
+    formData.append('video', file, file.name || 'pet-activity-video.mp4');
+
+    try {
+        const uploadRes = await fetch(getAiEndpoint('upload-video'), { method: 'POST', body: formData });
+
+        if (uploadRes.status === 404) {
+            return analyzeVideoSync(file, video, onProgress);
+        }
+
+        if (!uploadRes.ok) {
+            const errBody = await uploadRes.json().catch(() => ({}));
+            throw new Error(errBody.error || `upload_failed_${uploadRes.status}`);
+        }
+
+        const { taskId } = await uploadRes.json();
+        if (onProgress) onProgress(18, currentLang === 'zh' ? '已上传，千问 AI 分析中...' : 'Uploaded, Qwen AI analyzing...', 'requesting');
+        return await pollTaskResult(taskId, video, onProgress);
+    } catch (e) {
+        if (e.message && e.message.includes('Failed to fetch')) {
+            return analyzeVideoSync(file, video, onProgress);
+        }
+        throw e;
+    }
+}
+
+async function analyzeVideoSync(file, video, onProgress) {
     if (onProgress) onProgress(12, currentLang === 'zh' ? '正在上传视频到 AI 服务...' : 'Uploading video to AI service...', 'uploading');
 
     const formData = new FormData();
@@ -3057,6 +3120,33 @@ async function analyzeVideoWithAi(file, video, onProgress) {
     }
 
     return adaptAiBehaviorResult(payload, video);
+}
+
+async function pollTaskResult(taskId, video, onProgress) {
+    for (let i = 0; i < 150; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+
+        const res = await fetch(getAiEndpoint(`task/${taskId}`));
+        if (!res.ok) throw new Error('task_poll_failed');
+
+        const task = await res.json();
+
+        if (onProgress && task.status === 'processing') {
+            const pct = Math.max(20, Math.min(85, task.progress || 20));
+            onProgress(pct, currentLang === 'zh' ? '千问 AI 分析中...' : 'Qwen AI analyzing...', 'requesting');
+        }
+
+        if (task.status === 'completed') {
+            if (onProgress) onProgress(90, currentLang === 'zh' ? '正在整理结果...' : 'Preparing results...', 'requesting');
+            return adaptAiBehaviorResult(task.result, video);
+        }
+
+        if (task.status === 'failed') {
+            throw new Error(task.error || 'AI analysis failed.');
+        }
+    }
+
+    throw new Error('AI analysis timed out.');
 }
 
 function adaptAiBehaviorResult(aiResult, video) {
@@ -3585,6 +3675,7 @@ if (behaviorVideoInput && behaviorVideoPreview && behaviorAnalyzeBtn) {
         }
 
         behaviorAnalyzeBtn.disabled = true;
+        lastAiFailureReason = '';
         aiAnalysisBusy = true;
         setBehaviorProgress(5, i18nText[currentLang].statusPreparing, aiServiceInfo?.aiConfigured ? 'connected' : 'ready');
 
@@ -3594,13 +3685,25 @@ if (behaviorVideoInput && behaviorVideoPreview && behaviorAnalyzeBtn) {
                 result = await analyzeVideoWithAi(behaviorVideoFile, behaviorVideoPreview, (pct, text, state) => setBehaviorProgress(pct, text, state));
                 showToast(currentLang === 'zh' ? 'AI 视觉分析已完成。' : 'AI vision analysis completed.', 'success');
             } catch (aiErr) {
+                lastAiFailureReason = explainAiError(aiErr);
+                const aiFailureToast = currentLang === 'zh'
+                    ? '千问失败原因：' + lastAiFailureReason
+                    : `Qwen failure reason: ${lastAiFailureReason}`;
                 console.warn('AI analysis unavailable, falling back to local analysis:', aiErr);
                 showToast(currentLang === 'zh' ? 'AI 服务不可用，已改用本地分析。' : 'AI service unavailable, using local analysis.', 'warning');
                 setBehaviorProgress(60, currentLang === 'zh' ? 'AI 不可用，已切换本地分析。' : 'AI unavailable, using local analysis.', 'fallback', aiErr.message || '');
+                showToast(
+                    currentLang === 'zh'
+                        ? `千问失败原因：${lastAiFailureReason}`
+                        : `Qwen failure reason: ${lastAiFailureReason}`,
+                    'warning'
+                );
+                showToast(aiFailureToast, 'warning');
+                setAiStatusPanel('fallback', lastAiFailureReason);
                 result = await analyzeVideoBehavior(behaviorVideoPreview, (pct, text) => setBehaviorProgress(pct, text));
             }
             renderBehaviorAnalysis(result);
-            setBehaviorProgress(100, i18nText[currentLang].statusCompleted, 'completed');
+            setBehaviorProgress(100, i18nText[currentLang].statusCompleted, result.analysisSource === 'local' && lastAiFailureReason ? 'fallback' : 'completed', result.analysisSource === 'local' ? lastAiFailureReason : '');
             showToast(currentLang === 'zh' ? '已根据上传视频生成行为分析。' : 'Behavior analysis generated from uploaded video.', 'success');
         } catch (err) {
             console.error(err);
