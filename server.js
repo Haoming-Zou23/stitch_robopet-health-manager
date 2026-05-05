@@ -19,41 +19,6 @@ const DASHSCOPE_BASE_URL = process.env.DASHSCOPE_BASE_URL || 'https://dashscope.
 const MAX_FRAME_COUNT = Number(process.env.MAX_AI_FRAMES || 12);
 const MAX_UPLOAD_MB = Number(process.env.MAX_VIDEO_UPLOAD_MB || 80);
 
-const videoTasks = new Map();
-
-function taskFilePath(taskId) {
-    return path.join(frameRoot, `${taskId}.json`);
-}
-
-function saveTask(task) {
-    try {
-        fs.writeFileSync(taskFilePath(task.id), JSON.stringify(task), 'utf8');
-    } catch (err) {
-        console.warn('[saveTask failed]', err.message);
-    }
-}
-
-function loadTaskFromDisk(taskId) {
-    try {
-        const data = fs.readFileSync(taskFilePath(taskId), 'utf8');
-        const task = JSON.parse(data);
-        videoTasks.set(taskId, task);
-        return task;
-    } catch (err) {
-        return null;
-    }
-}
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [id, task] of videoTasks) {
-        if (now - task.createdAt > 10 * 60 * 1000) {
-            videoTasks.delete(id);
-            cleanupPath(taskFilePath(id));
-        }
-    }
-}, 5 * 60 * 1000);
-
 const uploadRoot = path.join(__dirname, 'uploads');
 const frameRoot = path.join(__dirname, 'frames');
 fs.mkdirSync(uploadRoot, { recursive: true });
@@ -77,8 +42,7 @@ app.get('/api/health', (req, res) => {
         aiConfigured: provider !== 'none',
         provider,
         model: provider === 'dashscope' ? QWEN_MODEL : OPENAI_MODEL,
-        textModel: provider === 'dashscope' ? QWEN_TEXT_MODEL : OPENAI_MODEL,
-        asyncVideo: true
+        textModel: provider === 'dashscope' ? QWEN_TEXT_MODEL : OPENAI_MODEL
     });
 });
 
@@ -603,97 +567,6 @@ function cleanupPath(targetPath, recursive = false) {
         fs.rmSync(targetPath, { force: true, recursive });
     } catch (err) {
         console.warn('[cleanup failed]', targetPath, err.message);
-    }
-}
-
-app.post('/api/upload-video', upload.single('video'), async (req, res) => {
-    const provider = getAiProvider();
-    if (provider === 'none') {
-        cleanupPath(req.file?.path);
-        return res.status(503).json({ error: 'No AI API key is configured.' });
-    }
-    if (!req.file) return res.status(400).json({ error: 'No video file uploaded.' });
-
-    const taskId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const task = { id: taskId, status: 'processing', progress: 10, result: null, error: null, createdAt: Date.now() };
-    videoTasks.set(taskId, task);
-    saveTask(task);
-
-    const videoPath = req.file.path;
-    const fileName = req.file.originalname;
-
-    processVideoTask(task, videoPath, fileName).catch(err => {
-        task.status = 'failed';
-        task.error = err.message || 'Unknown error';
-        saveTask(task);
-        console.error('[processVideoTask]', err);
-        cleanupPath(videoPath);
-    });
-
-    res.json({ taskId, status: 'processing' });
-});
-
-app.get('/api/task/:taskId', (req, res) => {
-    let task = videoTasks.get(req.params.taskId);
-    if (!task) task = loadTaskFromDisk(req.params.taskId);
-    if (!task) return res.status(404).json({ error: 'Task not found.' });
-    res.json({ status: task.status, progress: task.progress, result: task.result, error: task.error });
-});
-
-async function processVideoTask(task, videoPath, fileName) {
-    const outDir = path.join(frameRoot, task.id);
-    try {
-        fs.mkdirSync(outDir, { recursive: true });
-        task.progress = 15;
-        saveTask(task);
-        const metadata = await readVideoMetadata(videoPath);
-        task.progress = 25;
-        saveTask(task);
-        await extractFrames(videoPath, outDir);
-        task.progress = 40;
-        saveTask(task);
-
-        const frameFiles = fs.readdirSync(outDir)
-            .filter(file => file.toLowerCase().endsWith('.jpg'))
-            .sort()
-            .slice(0, MAX_FRAME_COUNT);
-
-        if (!frameFiles.length) throw new Error('Could not extract frames from this video.');
-
-        const frameInputs = frameFiles.map((file, index) => {
-            const imagePath = path.join(outDir, file);
-            const base64 = fs.readFileSync(imagePath).toString('base64');
-            const timestamp = estimateTimestamp(index, frameFiles.length, metadata.durationSec);
-            return {
-                timestamp,
-                input: { type: 'input_image', image_url: `data:image/jpeg;base64,${base64}`, detail: 'low' }
-            };
-        });
-
-        task.progress = 55;
-        saveTask(task);
-        const provider = getAiProvider();
-        const aiResult = await analyzeFramesWithProvider({ frameInputs, metadata, fileName });
-
-        task.progress = 85;
-        task.result = {
-            source: provider,
-            model: provider === 'dashscope' ? QWEN_MODEL : OPENAI_MODEL,
-            frameCount: frameInputs.length,
-            durationSec: metadata.durationSec,
-            width: metadata.width,
-            height: metadata.height,
-            ...aiResult
-        };
-        task.status = 'completed';
-        task.progress = 100;
-        saveTask(task);
-    } finally {
-        cleanupPath(videoPath);
-        setTimeout(() => {
-            cleanupPath(outDir, true);
-            cleanupPath(taskFilePath(task.id));
-        }, 30000);
     }
 }
 
