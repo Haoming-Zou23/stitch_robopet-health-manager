@@ -2999,8 +2999,7 @@ function getAiApiBase() {
     if (window.PET_AI_API_BASE) return window.PET_AI_API_BASE.replace(/\/$/, '');
     const host = window.location.hostname || '127.0.0.1';
     const protocol = window.location.protocol || 'http:';
-    if (window.location.port === '8001') return `${protocol}//${host}:8001`;
-    return 'http://127.0.0.1:8001';
+    return `${protocol}//${host}${window.location.port ? ':' + window.location.port : ''}`;
 }
 
 function getAiEndpoint(path) {
