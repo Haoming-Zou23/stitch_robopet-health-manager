@@ -20,10 +20,37 @@ const MAX_FRAME_COUNT = Number(process.env.MAX_AI_FRAMES || 12);
 const MAX_UPLOAD_MB = Number(process.env.MAX_VIDEO_UPLOAD_MB || 80);
 
 const videoTasks = new Map();
+
+function taskFilePath(taskId) {
+    return path.join(frameRoot, `${taskId}.json`);
+}
+
+function saveTask(task) {
+    try {
+        fs.writeFileSync(taskFilePath(task.id), JSON.stringify(task), 'utf8');
+    } catch (err) {
+        console.warn('[saveTask failed]', err.message);
+    }
+}
+
+function loadTaskFromDisk(taskId) {
+    try {
+        const data = fs.readFileSync(taskFilePath(taskId), 'utf8');
+        const task = JSON.parse(data);
+        videoTasks.set(taskId, task);
+        return task;
+    } catch (err) {
+        return null;
+    }
+}
+
 setInterval(() => {
     const now = Date.now();
     for (const [id, task] of videoTasks) {
-        if (now - task.createdAt > 10 * 60 * 1000) videoTasks.delete(id);
+        if (now - task.createdAt > 10 * 60 * 1000) {
+            videoTasks.delete(id);
+            cleanupPath(taskFilePath(id));
+        }
     }
 }, 5 * 60 * 1000);
 
@@ -590,6 +617,7 @@ app.post('/api/upload-video', upload.single('video'), async (req, res) => {
     const taskId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const task = { id: taskId, status: 'processing', progress: 10, result: null, error: null, createdAt: Date.now() };
     videoTasks.set(taskId, task);
+    saveTask(task);
 
     const videoPath = req.file.path;
     const fileName = req.file.originalname;
@@ -597,6 +625,7 @@ app.post('/api/upload-video', upload.single('video'), async (req, res) => {
     processVideoTask(task, videoPath, fileName).catch(err => {
         task.status = 'failed';
         task.error = err.message || 'Unknown error';
+        saveTask(task);
         console.error('[processVideoTask]', err);
         cleanupPath(videoPath);
     });
@@ -605,7 +634,8 @@ app.post('/api/upload-video', upload.single('video'), async (req, res) => {
 });
 
 app.get('/api/task/:taskId', (req, res) => {
-    const task = videoTasks.get(req.params.taskId);
+    let task = videoTasks.get(req.params.taskId);
+    if (!task) task = loadTaskFromDisk(req.params.taskId);
     if (!task) return res.status(404).json({ error: 'Task not found.' });
     res.json({ status: task.status, progress: task.progress, result: task.result, error: task.error });
 });
@@ -615,10 +645,13 @@ async function processVideoTask(task, videoPath, fileName) {
     try {
         fs.mkdirSync(outDir, { recursive: true });
         task.progress = 15;
+        saveTask(task);
         const metadata = await readVideoMetadata(videoPath);
         task.progress = 25;
+        saveTask(task);
         await extractFrames(videoPath, outDir);
         task.progress = 40;
+        saveTask(task);
 
         const frameFiles = fs.readdirSync(outDir)
             .filter(file => file.toLowerCase().endsWith('.jpg'))
@@ -638,6 +671,7 @@ async function processVideoTask(task, videoPath, fileName) {
         });
 
         task.progress = 55;
+        saveTask(task);
         const provider = getAiProvider();
         const aiResult = await analyzeFramesWithProvider({ frameInputs, metadata, fileName });
 
@@ -653,9 +687,13 @@ async function processVideoTask(task, videoPath, fileName) {
         };
         task.status = 'completed';
         task.progress = 100;
+        saveTask(task);
     } finally {
         cleanupPath(videoPath);
-        setTimeout(() => cleanupPath(outDir, true), 30000);
+        setTimeout(() => {
+            cleanupPath(outDir, true);
+            cleanupPath(taskFilePath(task.id));
+        }, 30000);
     }
 }
 
