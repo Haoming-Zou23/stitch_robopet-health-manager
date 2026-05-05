@@ -613,6 +613,7 @@ app.get('/api/task/:taskId', (req, res) => {
 async function processVideoTask(task, videoPath, fileName) {
     const outDir = path.join(frameRoot, task.id);
     try {
+        fs.mkdirSync(outDir, { recursive: true });
         task.progress = 15;
         const metadata = await readVideoMetadata(videoPath);
         task.progress = 25;
