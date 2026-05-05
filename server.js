@@ -33,6 +33,8 @@ app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use(express.static(__dirname));
 
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'app.html')));
+
 app.get('/api/health', (req, res) => {
     const provider = getAiProvider();
     res.json({
