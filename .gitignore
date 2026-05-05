@@ -1,0 +1,5 @@
+node_modules/
+uploads/
+frames/
+npm-debug.log*
+.env
