@@ -2,6 +2,7 @@ const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const ffmpeg = require('fluent-ffmpeg');
 const ffmpegPath = require('ffmpeg-static');
@@ -16,11 +17,13 @@ const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-5-mini';
 const QWEN_MODEL = process.env.QWEN_MODEL || 'qwen3-vl-plus';
 const QWEN_TEXT_MODEL = process.env.QWEN_TEXT_MODEL || 'qwen-plus';
 const DASHSCOPE_BASE_URL = process.env.DASHSCOPE_BASE_URL || 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+const QWEN_BASE_URL = process.env.QWEN_BASE_URL || DASHSCOPE_BASE_URL;
 const MAX_FRAME_COUNT = Number(process.env.MAX_AI_FRAMES || 12);
 const MAX_UPLOAD_MB = Number(process.env.MAX_VIDEO_UPLOAD_MB || 80);
 
-const uploadRoot = path.join(__dirname, 'uploads');
-const frameRoot = path.join(__dirname, 'frames');
+const runtimeRoot = process.env.RUNTIME_DATA_DIR || path.join(os.tmpdir(), 'stitch_robopet_health_manager');
+const uploadRoot = path.join(runtimeRoot, 'uploads');
+const frameRoot = path.join(runtimeRoot, 'frames');
 fs.mkdirSync(uploadRoot, { recursive: true });
 fs.mkdirSync(frameRoot, { recursive: true });
 
@@ -42,7 +45,9 @@ app.get('/api/health', (req, res) => {
         aiConfigured: provider !== 'none',
         provider,
         model: provider === 'dashscope' ? QWEN_MODEL : OPENAI_MODEL,
-        textModel: provider === 'dashscope' ? QWEN_TEXT_MODEL : OPENAI_MODEL
+        textModel: provider === 'dashscope' ? QWEN_TEXT_MODEL : OPENAI_MODEL,
+        baseUrl: provider === 'dashscope' ? QWEN_BASE_URL : undefined,
+        runtimeRoot
     });
 });
 
@@ -114,7 +119,7 @@ app.post('/api/pet-feeding-advice', async (req, res) => {
     }
 });
 
-app.post('/api/analyze-pet-video', upload.single('video'), async (req, res) => {
+app.post('/api/analyze-pet-video', requireAiProvider, upload.single('video'), async (req, res) => {
     let videoPath = req.file?.path;
     const runId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const outDir = path.join(frameRoot, runId);
@@ -198,9 +203,31 @@ function readVideoMetadata(videoPath) {
 }
 
 function getAiProvider() {
-    if (process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY) return 'dashscope';
+    if (process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY || isLocalBaseUrl(QWEN_BASE_URL)) return 'dashscope';
     if (process.env.OPENAI_API_KEY) return 'openai';
     return 'none';
+}
+
+function requireAiProvider(req, res, next) {
+    if (getAiProvider() === 'none') {
+        return res.status(503).json({ error: 'No AI API key or local Qwen endpoint is configured. Set DASHSCOPE_API_KEY, QWEN_API_KEY, or QWEN_BASE_URL/DASHSCOPE_BASE_URL to a local OpenAI-compatible server.' });
+    }
+    next();
+}
+
+function isLocalBaseUrl(value) {
+    try {
+        const url = new URL(value);
+        return ['localhost', '127.0.0.1', '::1'].includes(url.hostname);
+    } catch (err) {
+        return false;
+    }
+}
+
+function buildProviderHeaders(apiKey) {
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+    return headers;
 }
 
 function extractFrames(videoPath, outDir) {
@@ -240,12 +267,9 @@ async function generateTextWithProvider({ messages, temperature = 0.3, maxTokens
 
 async function generateTextWithDashScope({ messages, temperature, maxTokens }) {
     const apiKey = process.env.DASHSCOPE_API_KEY || process.env.QWEN_API_KEY;
-    const response = await fetch(`${DASHSCOPE_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
+    const response = await fetch(`${QWEN_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
         method: 'POST',
-        headers: {
-            Authorization: `Bearer ${apiKey}`,
-            'Content-Type': 'application/json'
-        },
+        headers: buildProviderHeaders(apiKey),
         body: JSON.stringify({
             model: QWEN_TEXT_MODEL,
             messages,
@@ -327,12 +351,9 @@ async function analyzeFramesWithDashScope({ frameInputs, prompt }) {
         }))
     ];
 
-    const response = await fetch(`${DASHSCOPE_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
+    const response = await fetch(`${QWEN_BASE_URL.replace(/\/$/, '')}/chat/completions`, {
         method: 'POST',
-        headers: {
-            Authorization: `Bearer ${apiKey}`,
-            'Content-Type': 'application/json'
-        },
+        headers: buildProviderHeaders(apiKey),
         body: JSON.stringify({
             model: QWEN_MODEL,
             messages: [{ role: 'user', content }],
@@ -569,6 +590,16 @@ function cleanupPath(targetPath, recursive = false) {
         console.warn('[cleanup failed]', targetPath, err.message);
     }
 }
+
+app.use((err, req, res, next) => {
+    if (!err) return next();
+    console.error('[request failed]', err);
+    const status = err instanceof multer.MulterError ? 400 : 500;
+    res.status(status).json({
+        error: err instanceof multer.MulterError ? 'Video upload failed.' : 'Server request failed.',
+        detail: err.message
+    });
+});
 
 app.listen(PORT, () => {
     console.log(`RoboPetCare AI server running at http://127.0.0.1:${PORT}/app.html`);
